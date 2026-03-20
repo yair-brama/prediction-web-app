@@ -1,0 +1,7 @@
+In the terminal - netstat -ano | findstr :8501
+
+And stop it with:
+
+taskkill /F /PID <the PID shown>
+
+Or just close the terminal session it was started from. The Ctrl+C method only works in the foreground terminal where Streamlit is actively running.

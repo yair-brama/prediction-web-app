@@ -14,8 +14,10 @@ st.set_page_config(
 )
 
 pg = st.navigation([
-    st.Page("pages/prediction_app.py", title="Prediction App",    icon="💰", default=True),
-    st.Page("pages/analysis.py",       title="Data Analysis",     icon="📊"),
+    st.Page("pages/prediction_app.py",     title="Prediction App",     icon="💰", default=True),
+    st.Page("pages/analysis.py",           title="Data Analysis",      icon="📊"),
+    st.Page("pages/test_data_analysis.py", title="Test Data Analysis", icon="🧪"),
+    st.Page("pages/model_insights.py",     title="Model Insights",     icon="🔍"),
 ])
 
 pg.run()

@@ -5,7 +5,12 @@ Single source of truth for constants and feature engineering.
 Imported by app.py, model_registry.py, and train_models.py.
 """
 
+from __future__ import annotations
+from typing import Any
+
 import pandas as pd
+import numpy as np
+import holidays
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -39,7 +44,42 @@ VALID_LOC_NUMBERS = [
     163, 164, 165, 166, 167, 168, 169, 170, 177, 179, 189,
 ]
 
-MAX_PRECIPITATION = 782.49  # max value seen during training
+MAX_PRECIPITATION = 782.49      # max value seen during training (old precipitation)
+MAX_PRECIPITATION_NEW = 7.71   # max value seen during new-precip model training (inches)
+
+# V2 features — adds holiday awareness on top of the original set
+FEATURES_V2 = [
+    "Precipitation",
+    "DayOfWeek",
+    "Month",
+    "DayOfMonth",
+    "WeekOfYear",
+    "IsWeekend",
+    "Quarter",
+    "Loc Number",
+    "IsHoliday",
+    "IsHolidayWeekend",
+    "DaysToNearestHoliday",
+]
+
+# V3 features — V2 + lag/rolling features for short-term forecasting
+FEATURES_V3 = [
+    "Precipitation",
+    "DayOfWeek",
+    "Month",
+    "DayOfMonth",
+    "WeekOfYear",
+    "IsWeekend",
+    "Quarter",
+    "Loc Number",
+    "IsHoliday",
+    "IsHolidayWeekend",
+    "DaysToNearestHoliday",
+    "Lag7",
+    "Lag14",
+    "Roll7Mean",
+    "Roll14Mean",
+]
 
 # ---------------------------------------------------------------------------
 # Location display labels  (Loc Number -> "N - City")
@@ -220,6 +260,152 @@ def _add_calendar_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def _add_holiday_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Add holiday-awareness columns to a DataFrame that already has a
+    datetime 'Date' column.
+
+    New columns:
+      IsHoliday           - 1 if the date is a US federal holiday, else 0
+      IsHolidayWeekend    - 1 if the date falls within a holiday weekend
+                            (the Sat-Sun-Mon cluster around a Monday holiday,
+                             or the Fri-Sat-Sun cluster around a Friday holiday,
+                             or any day within 1 day of any holiday)
+      DaysToNearestHoliday - integer distance (0-183) to the closest holiday
+    """
+    out = df.copy()
+    dates = pd.to_datetime(out["Date"])
+
+    # Build a set of US holiday dates covering all years in the data + 1 margin
+    years = sorted(dates.dt.year.unique())
+    year_range = range(min(years) - 1, max(years) + 2)
+    us_holidays = holidays.US(years=year_range)
+    holiday_dates = np.array(sorted(us_holidays.keys()), dtype="datetime64[D]")
+
+    date_vals = dates.values.astype("datetime64[D]")
+
+    # IsHoliday: exact match
+    holiday_set = set(us_holidays.keys())
+    out["IsHoliday"] = dates.dt.date.map(lambda d: 1 if d in holiday_set else 0)
+
+    # DaysToNearestHoliday: vectorized distance to closest holiday
+    # For each date, find the minimum absolute distance to any holiday
+    date_int = date_vals.astype(np.int64)
+    hol_int = holiday_dates.astype(np.int64)
+    # Use searchsorted for efficient nearest-neighbor lookup
+    idx = np.searchsorted(hol_int, date_int, side="left")
+    idx = np.clip(idx, 1, len(hol_int) - 1)
+    dist_left = np.abs(date_int - hol_int[idx - 1])
+    dist_right = np.abs(date_int - hol_int[idx])
+    out["DaysToNearestHoliday"] = np.minimum(dist_left, dist_right).astype(int)
+
+    # IsHolidayWeekend: date is within 1 day of a holiday
+    # This captures Fri/Sat/Sun/Mon around holiday weekends
+    out["IsHolidayWeekend"] = (out["DaysToNearestHoliday"] <= 1).astype(int)
+
+    return out
+
+
+def _add_lag_features(
+    df: pd.DataFrame,
+    history_df: pd.DataFrame | None = None,
+    target_col: str = "Unique Purchased Cards",
+) -> pd.DataFrame:
+    """
+    Add lag and rolling-window features per location.
+
+    Parameters
+    ----------
+    df : DataFrame
+        Must have columns: Loc Number, Date.
+        If used during training, must also have `target_col`.
+    history_df : DataFrame or None
+        At inference time, a DataFrame with columns
+        [Loc Number, Date, <target_col>] containing recent historical
+        sales.  At training time, pass None (lags come from df itself).
+    target_col : str
+        Name of the column with actual sales values.
+
+    New columns:
+      Lag7       - sales exactly 7 calendar days ago at the same location
+      Lag14      - sales exactly 14 calendar days ago at the same location
+      Roll7Mean  - mean of past 7 days (shift-1, per location)
+      Roll14Mean - mean of past 14 days (shift-1, per location)
+
+    Missing lags are filled with the location's day-of-week median,
+    then with the global median as a final fallback.
+    """
+    out = df.copy()
+    out["Date"] = pd.to_datetime(out["Date"])
+
+    # --- Build the source data for lag computation -------------------------
+    if history_df is not None:
+        # INFERENCE PATH: merge prediction rows with history
+        hist = history_df.copy()
+        hist["Date"] = pd.to_datetime(hist["Date"])
+        combined = pd.concat([
+            hist[["Loc Number", "Date", target_col]],
+            out[["Loc Number", "Date"]].assign(**{target_col: np.nan}),
+        ], ignore_index=True)
+        combined = combined.drop_duplicates(
+            subset=["Loc Number", "Date"], keep="first"
+        )
+    else:
+        # TRAINING PATH: target is already in df
+        combined = out[["Loc Number", "Date", target_col]].copy()
+
+    combined = combined.sort_values(["Loc Number", "Date"]).reset_index(drop=True)
+
+    # --- Lag7 / Lag14: merge-based (exact calendar-day semantics) ----------
+    for lag_days, col_name in [(7, "Lag7"), (14, "Lag14")]:
+        lookup = combined[["Loc Number", "Date", target_col]].copy()
+        lookup["Date"] = lookup["Date"] + pd.Timedelta(days=lag_days)
+        lookup = lookup.rename(columns={target_col: col_name})
+        combined = combined.merge(
+            lookup[["Loc Number", "Date", col_name]],
+            on=["Loc Number", "Date"],
+            how="left",
+        )
+
+    # --- Roll7Mean / Roll14Mean: shift-based rolling per location ----------
+    combined = combined.sort_values(["Loc Number", "Date"]).reset_index(drop=True)
+    grouped = combined.groupby("Loc Number", observed=True)[target_col]
+    combined["Roll7Mean"] = grouped.transform(
+        lambda s: s.shift(1).rolling(window=7, min_periods=1).mean()
+    )
+    combined["Roll14Mean"] = grouped.transform(
+        lambda s: s.shift(1).rolling(window=14, min_periods=1).mean()
+    )
+
+    # --- Fallback: per-location day-of-week median -------------------------
+    combined["_dow"] = combined["Date"].dt.dayofweek
+    fallback = (
+        combined.dropna(subset=[target_col])
+        .groupby(["Loc Number", "_dow"], observed=True)[target_col]
+        .median()
+        .rename("_fallback")
+    )
+    combined = combined.merge(fallback, on=["Loc Number", "_dow"], how="left")
+
+    lag_cols = ["Lag7", "Lag14", "Roll7Mean", "Roll14Mean"]
+    global_median = combined[target_col].median()
+    for col in lag_cols:
+        combined[col] = combined[col].fillna(combined["_fallback"])
+        combined[col] = combined[col].fillna(global_median)
+
+    combined = combined.drop(columns=["_dow", "_fallback"])
+
+    # --- Merge lag columns back onto original rows -------------------------
+    merge_cols = ["Loc Number", "Date"] + lag_cols
+    out = out.merge(
+        combined[merge_cols].drop_duplicates(subset=["Loc Number", "Date"]),
+        on=["Loc Number", "Date"],
+        how="left",
+    )
+
+    return out
+
+
 def _validate_loc_numbers(df: pd.DataFrame) -> None:
     """Raise ValueError if any Loc Number was not seen during training."""
     invalid = set(df["Loc Number"].unique()) - set(VALID_LOC_NUMBERS)
@@ -249,6 +435,62 @@ def engineer_features_lgbm(df: pd.DataFrame) -> pd.DataFrame:
         categories=VALID_LOC_NUMBERS,
     )
     return out[FEATURES]
+
+
+def engineer_features_lgbm_v2(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    V2 feature engineering for LightGBM — adds holiday features.
+
+    Same as engineer_features_lgbm but includes:
+      IsHoliday, IsHolidayWeekend, DaysToNearestHoliday
+
+    Input:  DataFrame with columns [Loc Number (int), Date (datetime-like), Precipitation (float)]
+    Output: DataFrame with exactly FEATURES_V2 columns in correct order and dtypes.
+    """
+    out = _add_calendar_features(df)
+    out = _add_holiday_features(out)
+    _validate_loc_numbers(out)
+    out["Loc Number"] = pd.Categorical(
+        out["Loc Number"],
+        categories=VALID_LOC_NUMBERS,
+    )
+    return out[FEATURES_V2]
+
+
+def engineer_features_lgbm_v3(
+    df: pd.DataFrame,
+    model_bundle: Any = None,
+) -> pd.DataFrame:
+    """
+    V3 feature engineering for LightGBM — holidays + lag/rolling features.
+
+    At inference time, ``model_bundle`` is the tuple returned by the V3
+    load function: ``(booster, calibrator, history_df)``.  The history_df
+    is used to compute lag features.
+
+    At training time, call with ``model_bundle=None``; lags are computed
+    from ``df`` itself (which must contain the target column).
+
+    Input:  DataFrame with columns [Loc Number, Date, Precipitation]
+            (and the target column when training).
+    Output: DataFrame with exactly FEATURES_V3 columns.
+    """
+    out = _add_calendar_features(df)
+    out = _add_holiday_features(out)
+
+    # Extract history from model bundle (inference) or use None (training)
+    history_df = None
+    if model_bundle is not None:
+        _, _, history_df = model_bundle  # (booster, calibrator, history)
+
+    out = _add_lag_features(out, history_df=history_df)
+
+    _validate_loc_numbers(out)
+    out["Loc Number"] = pd.Categorical(
+        out["Loc Number"],
+        categories=VALID_LOC_NUMBERS,
+    )
+    return out[FEATURES_V3]
 
 
 def engineer_features_sklearn(df: pd.DataFrame) -> pd.DataFrame:

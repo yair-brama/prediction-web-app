@@ -408,10 +408,11 @@ if mode == "Manual Entry":
     with predict_col:
         predict_clicked = st.button("Predict", type="primary", key="me_predict_btn")
 
-    if precipitation > MAX_PRECIPITATION:
+    _max_precip = active_wrapper.max_precipitation
+    if precipitation > _max_precip:
         st.warning(
             f"Precipitation ({precipitation:.2f} in) exceeds the training maximum "
-            f"({MAX_PRECIPITATION:.2f} in). The prediction may be less reliable."
+            f"({_max_precip:.2f} in). The prediction may be less reliable."
         )
 
     if predict_clicked:
@@ -426,7 +427,7 @@ if mode == "Manual Entry":
             with c1:
                 st.metric("Location", LOC_LABELS.get(loc_number, str(loc_number)))
             with c2:
-                st.metric("Date", str(input_date))
+                st.metric("Date", input_date.strftime("%m-%d-%Y"))
             with c3:
                 st.metric("Precipitation", f"{precipitation:.2f} in")
             with c4:
@@ -593,6 +594,7 @@ Extra columns are ignored.
 
         st.subheader("Prediction Results")
         display_df = results_df.copy()
+        display_df["Date"] = pd.to_datetime(display_df["Date"]).dt.strftime("%m-%d-%Y")
         display_df[pred_col] = display_df[pred_col].apply(
             lambda x: _format_pred_value(x, active_wrapper)
         )

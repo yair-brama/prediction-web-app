@@ -1,0 +1,20 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c \":*)",
+      "Bash(python /c/Users/yairb/Downloads/gen_html.py)",
+      "Bash(cygpath -w /tmp/analysis_data.json)",
+      "Bash(python -c \"import holidays; print\\(''holidays package available''\\)\")",
+      "Bash(pip install holidays --quiet)",
+      "Bash(python -m pip install holidays --quiet)",
+      "Bash(python train_calibrated_model.py)",
+      "Bash(python /c/Users/yairb/Downloads/gen_comparison_html.py)",
+      "Bash(python gen_v3_analysis.py)",
+      "Bash(python generate_v3_test_results.py)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''pages/model_insights.py'', doraise=True\\); print\\(''Syntax OK''\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\(''pages/test_data_analysis.py'', doraise=True\\); py_compile.compile\\(''app.py'', doraise=True\\); print\\(''All files compile OK''\\)\")",
+      "Bash(unzip -l \"C:/Users/yairb/OneDrive/Documents/Capstone/deployment_package.zip\")",
+      "Bash(python -X utf8 -c \":*)"
+    ]
+  }
+}

@@ -19,6 +19,8 @@ import pandas as pd
 
 from features import (
     engineer_features_lgbm,
+    engineer_features_lgbm_v2,
+    engineer_features_lgbm_v3,
     engineer_features_sklearn,
 )
 
@@ -66,13 +68,18 @@ class ModelWrapper:
     predict_fn: Callable
     description: str = ""
     target: str = "GL Rev"   # "GL Rev" or "Unique Purchased Cards"
+    max_precipitation: float = 782.49  # max value seen during training
+    engineer_needs_model: bool = False  # if True, predict() passes loaded_model to engineer_fn
 
     def predict(self, raw_df: pd.DataFrame, loaded_model: Any) -> np.ndarray:
         """
         End-to-end inference: apply feature engineering then predict.
         raw_df must have columns: Loc Number (int), Date (datetime-like), Precipitation (float).
         """
-        feature_df = self.engineer_fn(raw_df)
+        if self.engineer_needs_model:
+            feature_df = self.engineer_fn(raw_df, loaded_model)
+        else:
+            feature_df = self.engineer_fn(raw_df)
         return self.predict_fn(loaded_model, feature_df)
 
     @property
@@ -98,6 +105,53 @@ def _load_lgbm(model_file: str):
 def _predict_lgbm(model, feature_df: pd.DataFrame) -> np.ndarray:
     # num_iteration=-1 uses all trees (best_iteration is -1 in this saved model)
     return model.predict(feature_df, num_iteration=model.best_iteration)
+
+
+# ---------------------------------------------------------------------------
+# LightGBM + Isotonic calibration backend
+# ---------------------------------------------------------------------------
+
+def _load_lgbm_calibrated(model_file: str):
+    """Load the LightGBM booster + the companion isotonic calibrator."""
+    import lightgbm as lgb
+    import joblib
+    booster = lgb.Booster(model_file=model_file)
+    # Calibrator sits alongside the model file with a matching name
+    cal_file = model_file.replace("_model.txt", "_calibrator.joblib")
+    calibrator = joblib.load(cal_file)
+    return (booster, calibrator)
+
+
+def _predict_lgbm_calibrated(model_pair, feature_df: pd.DataFrame) -> np.ndarray:
+    """Run LightGBM inference then apply isotonic calibration."""
+    booster, calibrator = model_pair
+    raw_preds = booster.predict(feature_df, num_iteration=booster.best_iteration)
+    calibrated = calibrator.predict(raw_preds)
+    return np.maximum(calibrated, 0)  # ensure non-negative
+
+
+# ---------------------------------------------------------------------------
+# LightGBM + Isotonic calibration + Lag history backend (V3)
+# ---------------------------------------------------------------------------
+
+def _load_lgbm_calibrated_v3(model_file: str):
+    """Load LightGBM booster + isotonic calibrator + lag history."""
+    import lightgbm as lgb
+    import joblib
+    booster = lgb.Booster(model_file=model_file)
+    cal_file = model_file.replace("_model.txt", "_calibrator.joblib")
+    calibrator = joblib.load(cal_file)
+    hist_file = model_file.replace("_model.txt", "_history.parquet")
+    history = pd.read_parquet(hist_file)
+    return (booster, calibrator, history)
+
+
+def _predict_lgbm_calibrated_v3(model_triple, feature_df: pd.DataFrame) -> np.ndarray:
+    """Run LightGBM inference then apply isotonic calibration (V3)."""
+    booster, calibrator, _history = model_triple
+    raw_preds = booster.predict(feature_df, num_iteration=booster.best_iteration)
+    calibrated = calibrator.predict(raw_preds)
+    return np.maximum(calibrated, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -169,9 +223,74 @@ MODEL_REGISTRY: dict[str, ModelWrapper] = {
                     "with one-hot encoded location.",
         target="Unique Purchased Cards",
     ),
+    "lgbm_cards_new_precip": ModelWrapper(
+        display_name="LightGBM — New Precipitation (Purchased Cards)",
+        model_key="lgbm_cards_new_precip",
+        model_file=os.path.join(BASE_DIR, "lgbm_cards_new_precip_model.txt"),
+        engineer_fn=engineer_features_lgbm,
+        load_fn=_load_lgbm,
+        predict_fn=_predict_lgbm,
+        description=(
+            "**R² = 0.799 · MAE = 66 cards · RMSE = 99 cards**\n\n"
+            "Same LightGBM architecture as the original model, but trained on "
+            "**accurate historical precipitation data** (in inches) sourced from "
+            "Open-Meteo, replacing the original precipitation values.\n\n"
+            "**Training data:** Feb 2023 – Jun 2025 (≈128 k rows)  \n"
+            "**Test period:** Jun 2025 – Jan 2026 (≈32 k rows)  \n"
+            "**Features:** Location, Day of Week, Month, Day of Month, "
+            "Week of Year, Weekend flag, Quarter, Precipitation (inches)"
+        ),
+        target="Unique Purchased Cards",
+        max_precipitation=7.71,
+    ),
+    "lgbm_cards_calibrated": ModelWrapper(
+        display_name="LightGBM — Calibrated V2 (Purchased Cards)",
+        model_key="lgbm_cards_calibrated",
+        model_file=os.path.join(BASE_DIR, "lgbm_cards_calibrated_model.txt"),
+        engineer_fn=engineer_features_lgbm_v2,
+        load_fn=_load_lgbm_calibrated,
+        predict_fn=_predict_lgbm_calibrated,
+        description=(
+            "Improved LightGBM model with two key enhancements:\n\n"
+            "**1. Holiday features** — IsHoliday, IsHolidayWeekend, "
+            "DaysToNearestHoliday (US federal holidays)\n\n"
+            "**2. Bias calibration** — Isotonic regression post-processing "
+            "to correct the systematic over-prediction bias\n\n"
+            "**Training data:** Feb 2023 – Jun 2025 (70% train, 10% calibration)  \n"
+            "**Test period:** Jun 2025 – Jan 2026 (20%)  \n"
+            "**Features:** Location, Day of Week, Month, Day of Month, "
+            "Week of Year, Weekend flag, Quarter, Precipitation (inches), "
+            "IsHoliday, IsHolidayWeekend, DaysToNearestHoliday"
+        ),
+        target="Unique Purchased Cards",
+        max_precipitation=7.71,
+    ),
+    "lgbm_cards_lag": ModelWrapper(
+        display_name="LightGBM \u2014 Lag V3 (Purchased Cards)",
+        model_key="lgbm_cards_lag",
+        model_file=os.path.join(BASE_DIR, "lgbm_cards_lag_model.txt"),
+        engineer_fn=engineer_features_lgbm_v3,
+        load_fn=_load_lgbm_calibrated_v3,
+        predict_fn=_predict_lgbm_calibrated_v3,
+        description=(
+            "Best short-term model with three layers of improvements:\n\n"
+            "**1. Lag features** \u2014 Lag-7, Lag-14, 7-day and 14-day "
+            "rolling mean per location (r=0.74 with target)\n\n"
+            "**2. Holiday features** \u2014 IsHoliday, IsHolidayWeekend, "
+            "DaysToNearestHoliday\n\n"
+            "**3. Bias calibration** \u2014 Isotonic regression post-processing\n\n"
+            "**Best for:** predicting tomorrow / this week when recent "
+            "sales data is available.\n\n"
+            "**Features:** All V2 features + Lag7, Lag14, Roll7Mean, Roll14Mean"
+        ),
+        target="Unique Purchased Cards",
+        max_precipitation=7.71,
+        engineer_needs_model=True,
+    ),
 }
 
 # Controls the order models appear in the sidebar radio.
-# Only lgbm_cards is exposed in the UI; the others remain in the registry
-# so their artifacts are still loadable but are not shown to users.
-MODEL_DISPLAY_ORDER: list[str] = ["lgbm_cards"]
+MODEL_DISPLAY_ORDER: list[str] = [
+    "lgbm_cards", "lgbm_cards_new_precip",
+    "lgbm_cards_calibrated", "lgbm_cards_lag",
+]
